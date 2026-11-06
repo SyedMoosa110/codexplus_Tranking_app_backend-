@@ -1,0 +1,293 @@
+// prisma/schema.prisma
+// Enterprise Remote Employee Monitoring & Time Tracking Platform Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  IT_ADMIN
+  MANAGER
+  EMPLOYEE
+}
+
+enum DeviceStatus {
+  ACTIVE
+  PENDING
+  REVOKED
+}
+
+enum SessionStatus {
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+enum CorrectionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Organization {
+  id             String          @id @default(uuid()) @db.Uuid
+  name           String
+  timezone       String          @default("Asia/Karachi")
+  retentionDays  Int             @default(90)
+  createdAt      DateTime        @default(now()) @db.Timestamptz
+  users          User[]
+  devices        Device[]
+  policies       Policy[]
+  projects       Project[]
+  auditLogs      AuditLog[]
+  dailySummaries DailySummary[]
+}
+
+model Team {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  name           String
+  managerId      String?  @db.Uuid
+  createdAt      DateTime @default(now()) @db.Timestamptz
+  users          User[]
+}
+
+model User {
+  id                 String              @id @default(uuid()) @db.Uuid
+  organizationId     String              @db.Uuid
+  teamId             String?             @db.Uuid
+  policyId           String?             @db.Uuid
+  email              String
+  fullName           String
+  role               Role                @default(EMPLOYEE)
+  passwordHash       String
+  mfaSecret          String?
+  isActive           Boolean             @default(true)
+  createdAt          DateTime            @default(now()) @db.Timestamptz
+  updatedAt          DateTime            @updatedAt @db.Timestamptz
+
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  team               Team?               @relation(fields: [teamId], references: [id])
+  policy             Policy?             @relation(fields: [policyId], references: [id])
+  devices            Device[]
+  sessions           WorkSession[]
+  refreshTokens      RefreshToken[]
+  assignedTasks      Task[]              @relation("TaskAssignee")
+  workLogs           WorkLog[]
+  dailySummaries     DailySummary[]
+  correctionRequests CorrectionRequest[] @relation("UserCorrections")
+  reviewedRequests   CorrectionRequest[] @relation("ApproverCorrections")
+
+  @@unique([organizationId, email])
+  @@index([organizationId, role])
+  @@index([organizationId, teamId])
+}
+
+model Device {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @db.Uuid
+  userId         String         @db.Uuid
+  deviceUuid     String         // Hardware identifier from Windows agent
+  hostname       String
+  osVersion      String?
+  agentVersion   String?
+  status         DeviceStatus   @default(ACTIVE)
+  lastSeenAt     DateTime?      @db.Timestamptz
+  revokedAt      DateTime?      @db.Timestamptz
+  createdAt      DateTime       @default(now()) @db.Timestamptz
+
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  sessions       WorkSession[]
+  events         ActivityEvent[]
+  refreshTokens  RefreshToken[]
+
+  @@unique([organizationId, deviceUuid])
+  @@index([userId])
+}
+
+model RefreshToken {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @db.Uuid
+  deviceId       String?      @db.Uuid
+  tokenHash      String       @unique
+  familyId       String       @default(uuid()) @db.Uuid
+  isRevoked      Boolean      @default(false)
+  expiresAt      DateTime     @db.Timestamptz
+  createdAt      DateTime     @default(now()) @db.Timestamptz
+
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device         Device?      @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@index([userId, familyId])
+}
+
+model WorkSession {
+  id                 String              @id @default(uuid()) @db.Uuid
+  userId             String              @db.Uuid
+  deviceId           String              @db.Uuid
+  startAt            DateTime            @db.Timestamptz
+  endAt              DateTime?           @db.Timestamptz
+  status             SessionStatus       @default(ACTIVE)
+  closeReason        String?             // USER | LOGOFF | SLEEP | SHUTDOWN | TIMEOUT
+  createdAt          DateTime            @default(now()) @db.Timestamptz
+  updatedAt          DateTime            @updatedAt @db.Timestamptz
+
+  user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device             Device              @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  events             ActivityEvent[]
+  segments           AppUsageSegment[]
+  correctionRequests CorrectionRequest[]
+
+  @@index([userId, startAt])
+  @@index([deviceId, startAt])
+}
+
+model ActivityEvent {
+  id             String       @id @db.Uuid // Client-generated UUID for strict idempotency
+  sessionId      String       @db.Uuid
+  deviceId       String       @db.Uuid
+  type           String       // HEARTBEAT | IDLE_START | IDLE_END | APP_CHANGE | PAUSE | RESUME
+  occurredAt     DateTime     @db.Timestamptz // UTC time recorded on device
+  receivedAt     DateTime     @default(now()) @db.Timestamptz
+  clockOffsetMs  Int?         // Estimated drift offset between client and server clock
+  payload        Json?        // { processName, category, windowTitle }
+
+  session        WorkSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  device         Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, occurredAt])
+  @@index([sessionId, occurredAt])
+}
+
+model AppUsageSegment {
+  id          String       @id @default(uuid()) @db.Uuid
+  sessionId   String       @db.Uuid
+  processName String
+  category    String       @default("UNCATEGORIZED")
+  windowTitle String?      // Opt-in privacy: masked by default
+  startedAt   DateTime     @db.Timestamptz
+  endedAt     DateTime     @db.Timestamptz
+  seconds     Int
+
+  session     WorkSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, startedAt])
+  @@index([processName, category])
+}
+
+model Policy {
+  id                  String       @id @default(uuid()) @db.Uuid
+  organizationId      String       @db.Uuid
+  name                String
+  scheduleJson        Json?        // e.g., { "mon": { "start": "09:00", "end": "18:00" } }
+  idleThresholdSec    Int          @default(180)
+  captureProcess      Boolean      @default(true)
+  captureWindowTitle  Boolean      @default(false)
+  captureScreenshots  Boolean      @default(false)
+  screenshotEverySec  Int?
+  maskedApps          String[]     @default(["1password", "bitwarden", "keepass", "whatsapp", "telegram"])
+  createdAt           DateTime     @default(now()) @db.Timestamptz
+
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users               User[]
+}
+
+model Project {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  name           String
+  description    String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks          Task[]
+}
+
+model Task {
+  id          String       @id @default(uuid()) @db.Uuid
+  projectId   String       @db.Uuid
+  assigneeId  String       @db.Uuid
+  title       String
+  description String?
+  status      String       @default("TODO") // TODO | IN_PROGRESS | DONE
+  dueDate     DateTime?    @db.Timestamptz
+  createdAt   DateTime     @default(now()) @db.Timestamptz
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignee    User         @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  logs        WorkLog[]
+}
+
+model WorkLog {
+  id        String       @id @default(uuid()) @db.Uuid
+  taskId    String       @db.Uuid
+  userId    String       @db.Uuid
+  startAt   DateTime     @db.Timestamptz
+  endAt     DateTime?    @db.Timestamptz
+  note      String?
+  createdAt DateTime     @default(now()) @db.Timestamptz
+
+  task      Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model DailySummary {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @db.Uuid
+  organizationId String       @db.Uuid
+  summaryDate    DateTime     @db.Date
+  trackedSec     Int          @default(0)
+  activeSec      Int          @default(0)
+  idleSec        Int          @default(0)
+  firstStart     DateTime?    @db.Timestamptz
+  lastEnd        DateTime?    @db.Timestamptz
+  createdAt      DateTime     @default(now()) @db.Timestamptz
+  updatedAt      DateTime     @updatedAt @db.Timestamptz
+
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, summaryDate])
+  @@index([organizationId, summaryDate])
+}
+
+model CorrectionRequest {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @db.Uuid
+  sessionId        String           @db.Uuid
+  approverId       String?          @db.Uuid
+  requestedStartAt DateTime         @db.Timestamptz
+  requestedEndAt   DateTime         @db.Timestamptz
+  reason           String
+  reviewNote       String?
+  status           CorrectionStatus @default(PENDING)
+  createdAt        DateTime         @default(now()) @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @db.Timestamptz
+
+  user             User             @relation("UserCorrections", fields: [userId], references: [id], onDelete: Cascade)
+  session          WorkSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  approver         User?            @relation("ApproverCorrections", fields: [approverId], references: [id])
+}
+
+model AuditLog {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  actorId        String       @db.Uuid
+  action         String       // e.g. "VIEW_TIMELINE", "UPDATE_POLICY", "REVOKE_DEVICE"
+  targetType     String       // e.g. "USER", "POLICY", "DEVICE"
+  targetId       String?
+  ip             String?
+  metadata       Json?
+  createdAt      DateTime     @default(now()) @db.Timestamptz
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+}
